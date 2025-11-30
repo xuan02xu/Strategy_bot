@@ -1,0 +1,29 @@
+name: Check Turtle Strategy
+
+on:
+  schedule:
+    # 每 15 分鐘執行一次
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # 允許手動按按鈕測試
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install ccxt pandas requests
+
+      - name: Run script
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py

@@ -2,70 +2,106 @@ import ccxt
 import pandas as pd
 import requests
 import os
+import numpy as np
 
-# --- 設定區 (這些會從 GitHub 後台讀取，不用改) ---
+# --- 設定區 ---
 TG_TOKEN = os.environ['TG_TOKEN']
 TG_CHAT_ID = os.environ['TG_CHAT_ID']
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '4h'
 
+# --- 💰 資金管理 ---
+TOTAL_CAPITAL = 80.0
+RISK_PER_TRADE = 0.1
+
+# --- 風控參數 ---
+ATR_PERIOD = 20
+SL_MULTIPLIER = 2.0   # 初始止損 2ATR
+TP_MULTIPLIER = 3.0   # 初始止盈 3ATR
+TRAILING_SL_MULT = 1.5 # 移動止損 (比初始緊一點，保護獲利)
+
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": message
-        }
+        payload = {"chat_id": TG_CHAT_ID, "text": message}
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"發送失敗: {e}")
 
 def run_strategy():
-    print(f"🐢 正在檢查 {SYMBOL} {TIMEFRAME} 海龜 v16.0 訊號...")
+    print(f"🐢 正在執行 {SYMBOL} {TIMEFRAME} 海龜 v18.0 (趨勢追蹤版)...")
     try:
-        # 連接 OKX (只讀取數據，不需要 API Key)
         exchange = ccxt.okx()
-        
-        # 抓取最近 100 根 K 線 (確保數據足夠計算 20MA)
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
-        # v16.0 策略計算
-        # 上軌：過去 20 根 K 棒的最高價 (不含當前這根，所以 shift 1)
-        df['upper'] = df['high'].shift(1).rolling(window=20).max()
-        # 成交量均線：過去 20 根的平均量
+        # --- 指標計算 ---
+        df['upper'] = df['high'].shift(1).rolling(window=20).max() # 20日高點
+        df['lower'] = df['low'].shift(1).rolling(window=10).min()  # 10日低點 (海龜離場線)
         df['vol_ma'] = df['volume'].shift(1).rolling(window=20).mean()
-        
-        # 取得「剛收盤」的那根 K 棒 (倒數第二根，因為 -1 是還沒收盤的)
-        last_closed = df.iloc[-2]
-        
-        # 數值提取
-        price = last_closed['close']
-        open_price = last_closed['open']
-        upper = last_closed['upper']
-        vol = last_closed['volume']
-        vol_limit = last_closed['vol_ma'] * 1.2
-        
-        print(f"📊 收盤價: {price} | 上軌阻力: {upper} | 成交量: {vol} (門檻: {vol_limit})")
 
-        # 觸發條件 (v16.0 高勝率版)：
-        # 1. 價格突破 20日新高
-        # 2. 成交量 > 1.2倍均量 (爆量)
-        # 3. 收盤價 > 開盤價 (實體陽線)
-        if (price > upper) and (vol > vol_limit) and (price > open_price):
-            msg = (f"🐢 【海龜 v16.0 狙擊訊號】 🐢\n"
+        # ATR 計算
+        df['prev_close'] = df['close'].shift(1)
+        df['tr'] = df[['high', 'low', 'close']].apply(
+            lambda x: max(x['high'] - x['low'], abs(x['high'] - df['prev_close'][x.name]), abs(x['low'] - df['prev_close'][x.name])), axis=1
+        )
+        # 修正：這裡使用簡單寫法處理 TR，避免複雜索引報錯，實際應用建議用標準 TR 邏輯
+        df['tr1'] = df['high'] - df['low']
+        df['tr2'] = abs(df['high'] - df['prev_close'])
+        df['tr3'] = abs(df['low'] - df['prev_close'])
+        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        df['atr'] = df['tr'].rolling(window=ATR_PERIOD).mean()
+        
+        # 取得最新收盤數據
+        last = df.iloc[-2]
+        price = last['close']
+        atr_value = last['atr']
+        
+        # 計算關鍵價位
+        entry_sl = price - (atr_value * SL_MULTIPLIER)      # 初始止損
+        entry_tp = price + (atr_value * TP_MULTIPLIER)      # 初始止盈
+        trailing_sl = price - (atr_value * TRAILING_SL_MULT) # 移動止損 (動態)
+        turtle_exit = last['lower'] # 海龜傳統離場點 (10日低點)
+
+        # 資金控管
+        sl_dist = atr_value * SL_MULTIPLIER
+        risk_amt = TOTAL_CAPITAL * RISK_PER_TRADE
+        pos_usdt = (risk_amt / sl_dist) * price
+        lev = pos_usdt / TOTAL_CAPITAL
+        if lev < 1: lev = 1
+
+        # --- 判斷邏輯 ---
+        is_buy_signal = (price > last['upper']) and (last['volume'] > last['vol_ma'] * 1.2) and (price > last['open'])
+        
+        # --- 建構訊息 ---
+        msg = ""
+        if is_buy_signal:
+            msg = (f"🚀 【海龜 v18.0 狙擊訊號】\n"
                    f"----------------------\n"
-                   f"幣種: {SYMBOL}\n"
+                   f"🔥 狀態: 突破進場！\n"
                    f"現價: {price}\n"
-                   f"狀態: 🔥 突破20日新高 + 爆量！\n"
-                   f"動作: 快去 BingX 開多 20U！")
-            send_telegram(msg)
-            print("✅ 訊號已發送！")
+                   f"建議開倉: {pos_usdt:.0f} U ({lev:.1f}x)\n"
+                   f"🛑 初始止損: {entry_sl:.2f}\n"
+                   f"💰 初始止盈: {entry_tp:.2f}")
         else:
-            print("💤 未觸發訊號，繼續等待...")
-            
+            # 這是你要的功能：如果沒訊號，就告訴持倉者現在該怎麼辦
+            msg = (f"🐢 【海龜持倉 4H 追蹤】\n"
+                   f"----------------------\n"
+                   f"狀態: 持倉觀察 / 空手等待\n"
+                   f"現價: {price}\n"
+                   f"----------------------\n"
+                   f"👇 若您持有【多單】請參考 👇\n"
+                   f"🛡️ 建議移動止損(ATR): {trailing_sl:.2f}\n"
+                   f"🐢 海龜離場線(10日低): {turtle_exit:.2f}\n"
+                   f"----------------------\n"
+                   f"💡 說明: 若價格跌破 {turtle_exit:.2f} 建議全部離場。")
+
+        # 發送
+        send_telegram(msg)
+        print("✅ 狀態更新已發送 Telegram")
+
     except Exception as e:
-        print(f"❌ 發生錯誤: {e}")
+        print(f"❌ 錯誤: {e}")
 
 if __name__ == "__main__":
     run_strategy()

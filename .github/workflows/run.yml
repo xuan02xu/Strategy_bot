@@ -2,8 +2,9 @@ name: Check Turtle Strategy
 
 on:
   schedule:
-    # 每 15 分鐘執行一次
-    - cron: '*/15 * * * *'
+    # 修正：每 4 小時執行一次 (0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC)
+    # 這完美對應 4H K線的收盤時間
+    - cron: '0 */4 * * *'
   workflow_dispatch: # 允許手動按按鈕測試
 
 jobs:
@@ -19,8 +20,9 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
+        # 修正：補上 numpy，否則新版程式會報錯
         run: |
-          pip install ccxt pandas requests
+          pip install ccxt pandas requests numpy
 
       - name: Run script
         env:
